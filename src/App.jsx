@@ -76,26 +76,46 @@ export default function Game() {
     const bldgs = [...BUILDING_TYPES].sort(() => Math.random() - 0.5);
     const cards = {};
     players.forEach(p => { cards[p] = ['Yes_1', 'Yes_2', 'Yes_3', 'No_1', 'No_2', 'No_3', 'Wildcard', 'Indifferent']; });
-    setTiles({[players[0]]: all.slice(0, 30), [players[1]]: all.slice(30, 60)});
+
+    const dealtTiles = {[players[0]]: [], [players[1]]: []};
+    const groupedByFamily = {};
+    all.forEach(tile => {
+      const family = tile.type.replace('__type_2_', '');
+      if(!groupedByFamily[family]) groupedByFamily[family] = [];
+      groupedByFamily[family].push(tile);
+    });
+    let oddGoesTo = 0;
+    Object.values(groupedByFamily).forEach(group => {
+      const shuffled = [...group].sort(() => Math.random() - 0.5);
+      const half = Math.floor(shuffled.length / 2);
+      dealtTiles[players[0]].push(...shuffled.slice(0, half));
+      dealtTiles[players[1]].push(...shuffled.slice(half, half * 2));
+      if(shuffled.length % 2 === 1) {
+        dealtTiles[players[oddGoesTo]].push(shuffled[shuffled.length - 1]);
+        oddGoesTo = 1 - oddGoesTo;
+      }
+    });
+
+    setTiles(dealtTiles);
     setSecretBuildings({[players[0]]: bldgs[0], [players[1]]: bldgs[1]});
     setVotingCards(cards);
     setScores({[players[0]]: 15, [players[1]]: 15});
     setStarted(true);
   };
   
-  const calcMoves = (tile) => {
+  const calcMovesForState = (tile, boardState, workersState, placedTilesState) => {
     const type = tile.type.startsWith('Road') ? 'road' : tile.type.startsWith('River') ? 'river' : 'railroad';
     const tracks = type === 'railroad' ? ['topsy','turvy'] : [type];
     const moves = [];
     tracks.forEach(track => {
-      const w = workers[track];
+      const w = workersState[track];
       [{dx:1,dy:0,r:0},{dx:0,dy:1,r:90},{dx:-1,dy:0,r:180},{dx:0,dy:-1,r:270}].forEach(d => {
         // Normal moves (starting adjacent)
         const cells = Array(tile.size).fill(0).map((_,i) => [w.c+d.dx*(i+1), w.r+d.dy*(i+1)]);
         const ok = cells.every(([c,r],i) => {
           if(c<0||c>14||r<0||r>9) return false;
           if((c===0&&r===0)||(c===14&&r===0)||(c===0&&r===9)||(c===14&&r===9)) return false;
-          if(board[r][c].covered) return false;
+          if(boardState[r][c].covered) return false;
           if(i===0) {
             const dc=Math.abs(c-w.c), dr=Math.abs(r-w.r);
             if(dc===1&&dr===0||dc===0&&dr===1) return true;
@@ -110,14 +130,14 @@ export default function Game() {
         const canBridge = bridgeCells.every(([c,r],i) => {
           if(c<0||c>14||r<0||r>9) return false;
           if((c===0&&r===0)||(c===14&&r===0)||(c===0&&r===9)||(c===14&&r===9)) return false;
-          if(board[r][c].covered) return false;
+          if(boardState[r][c].covered) return false;
           if(i===0) {
             // Check if jumping over a 3-size tile
             const midC = w.c + d.dx;
             const midR = w.r + d.dy;
             if(midC<0||midC>14||midR<0||midR>9) return false;
-            if(!board[midR][midC].covered) return false;
-            return placedTiles.some(t => t.size===3 && t.cells.some(([tc,tr]) => tc===midC && tr===midR));
+            if(!boardState[midR][midC].covered) return false;
+            return placedTilesState.some(t => t.size===3 && t.cells.some(([tc,tr]) => tc===midC && tr===midR));
           }
           return true;
         });
@@ -126,8 +146,10 @@ export default function Game() {
     });
     return moves;
   };
+
+  const calcMoves = (tile) => calcMovesForState(tile, board, workers, placedTiles);
   
-  const calculateScores = () => {
+  const calculateScores = (boardState) => {
     const newScores = {};
     players.forEach(player => {
       const building = secretBuildings[player];
@@ -136,7 +158,7 @@ export default function Game() {
       Object.entries(BUILDINGS).forEach(([key, bldg]) => {
         if(bldg.type === building) {
           const [c, r] = key.split(',').map(Number);
-          if(board[r][c].covered) lostPoints += bldg.points;
+          if(boardState[r][c].covered) lostPoints += bldg.points;
         }
       });
       newScores[player] = 15 - lostPoints;
@@ -252,19 +274,19 @@ export default function Game() {
     setPlacedTiles(newPlacedTiles);
     setWorkers(nw);
     setTiles(nt);
-    setTimeout(() => {
-      const newScores = calculateScores();
-      setScores(newScores);
-      const noMoves = players.every(p => {
-        const pTiles = nt[p] || [];
-        return pTiles.length === 0 || pTiles.every(t => calcMoves(t).length === 0);
-      });
-      if(noMoves) {
-        setGameEnded(true);
-        const winnerName = Object.keys(newScores).reduce((a, b) => newScores[a] > newScores[b] ? a : b);
-        setWinner(winnerName);
-      } else { setCurrentPlayer(1 - currentPlayer); }
-    }, 100);
+
+    const newScores = calculateScores(nb);
+    setScores(newScores);
+    const noMoves = players.every(p => {
+      const pTiles = nt[p] || [];
+      return pTiles.length === 0 || pTiles.every(t => calcMovesForState(t, nb, nw, newPlacedTiles).length === 0);
+    });
+    if(noMoves) {
+      setGameEnded(true);
+      const winnerName = Object.keys(newScores).reduce((a, b) => newScores[a] > newScores[b] ? a : b);
+      setWinner(winnerName);
+    } else { setCurrentPlayer(1 - currentPlayer); }
+
     setDragging(null);
     setValidMoves([]);
     setPreviewMove(null);
@@ -311,7 +333,7 @@ export default function Game() {
             <h2 style={{margin:0}}>Wacky West - {pn}</h2>
             <div style={{display:'flex',gap:'20px',marginTop:'8px',fontSize:'14px'}}>
               <span>Tiles: {pt.length}</span>
-              {Object.entries(scores).map(([player, score]) => <span key={player} style={{fontWeight: player === pn ? 'bold' : 'normal'}}>{player}: {score} points</span>)}
+              <span style={{fontWeight:'bold'}}>{pn}: {scores[pn] ?? 15} points</span>
             </div>
           </div>
           <div style={{display:'flex',gap:'5px',flexWrap:'wrap',maxWidth:'300px'}}>
