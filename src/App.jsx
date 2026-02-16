@@ -37,8 +37,19 @@ const IMAGES = {
 };
 
 export default function Game() {
+  const [playerName, setPlayerName] = useState(localStorage.getItem('www_name') || '');
+  const [roomId, setRoomId] = useState(() => {
+    const fromHash = window.location.hash.replace('#', '').trim();
+    return fromHash || Math.random().toString(36).slice(2, 8).toUpperCase();
+  });
+  const [seatIndex, setSeatIndex] = useState(null);
+  const [seatToken, setSeatToken] = useState(localStorage.getItem(`www_token_${window.location.hash.replace('#', '')}`) || '');
+  const [roomMeta, setRoomMeta] = useState({ seats: {}, hostSeat: null, started: false, maxPlayers: 4 });
+  const [socketReady, setSocketReady] = useState(false);
+  const [viewingPanelPlayer, setViewingPanelPlayer] = useState(null);
+  const applyingRemoteRef = useRef(false);
   const [started, setStarted] = useState(false);
-  const [players] = useState(['Player 1', 'Player 2']);
+  const [players, setPlayers] = useState([]);
   const [currentPlayer, setCurrentPlayer] = useState(0);
   const [secretBuildings, setSecretBuildings] = useState({});
   const [workers, setWorkers] = useState({topsy: {c:0, r:0}, road: {c:14, r:0}, river: {c:0, r:9}, turvy: {c:14, r:9}});
@@ -56,7 +67,84 @@ export default function Game() {
   const [pendingVote, setPendingVote] = useState(null);
   const [voteSelections, setVoteSelections] = useState({});
   const [wildcardChoice, setWildcardChoice] = useState(null);
+  const [hoveredPlacedTileIndex, setHoveredPlacedTileIndex] = useState(null);
+  const isMyTurn = seatIndex === currentPlayer;
+  const isHost = seatIndex !== null && roomMeta.hostSeat === seatIndex;
+  const myPlayerName = seatIndex !== null ? (roomMeta.seats?.[seatIndex]?.name || `Player ${seatIndex + 1}`) : null;
   const boardRef = useRef(null);
+
+  const api = async (path, method = 'GET', body) => {
+    const res = await fetch(path, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return res.json();
+  };
+
+  const joinRoom = async () => {
+    window.location.hash = roomId;
+    const payload = await api('/api/join', 'POST', { roomId, playerName: playerName || undefined, seatToken });
+    if(payload.error) return;
+    setSocketReady(true);
+    setSeatIndex(payload.seatIndex);
+    setSeatToken(payload.seatToken);
+    localStorage.setItem(`www_token_${roomId}`, payload.seatToken);
+    if (playerName) localStorage.setItem('www_name', playerName);
+    setRoomMeta(payload.state);
+    setStarted(payload.state.started);
+  };
+
+  useEffect(() => {
+    joinRoom();
+  }, [roomId]);
+
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      if (!roomId) return;
+      const payload = await api(`/api/state?roomId=${encodeURIComponent(roomId)}`);
+      const state = payload.state;
+      if (!state) return;
+      setRoomMeta(state);
+      setStarted(state.started);
+      const names = Object.entries(state.seats)
+        .sort((a, b) => Number(a[0]) - Number(b[0]))
+        .map(([_, v], idx) => v.name || `Player ${idx + 1}`);
+      setPlayers(names);
+      if (seatToken) await api('/api/ping', 'POST', { roomId, seatToken });
+      if (state.gameState && !applyingRemoteRef.current) {
+        applyingRemoteRef.current = true;
+        const gs = state.gameState;
+        setCurrentPlayer(gs.currentPlayer);
+        setSecretBuildings(gs.secretBuildings);
+        setWorkers(gs.workers);
+        setBoard(gs.board);
+        setPlacedTiles(gs.placedTiles);
+        setTiles(gs.tiles);
+        setVotingCards(gs.votingCards);
+        setScores(gs.scores);
+        setGameEnded(gs.gameEnded);
+        setWinner(gs.winner);
+        setPendingVote(gs.pendingVote);
+        setVoteSelections(gs.voteSelections);
+        setWildcardChoice(null);
+        setTimeout(() => { applyingRemoteRef.current = false; }, 0);
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [roomId, seatToken]);
+
+  useEffect(() => {
+    if (!started || applyingRemoteRef.current || seatIndex === null || !seatToken) return;
+    api('/api/sync', 'POST', {
+      roomId,
+      seatToken,
+      state: {
+        currentPlayer, secretBuildings, workers, board, placedTiles, tiles,
+        votingCards, scores, gameEnded, winner, pendingVote, voteSelections,
+      },
+    });
+  }, [roomId, started, seatIndex, seatToken, currentPlayer, secretBuildings, workers, board, placedTiles, tiles, votingCards, scores, gameEnded, winner, pendingVote, voteSelections]);
   
   const startGame = () => {
     const all = [];
@@ -77,7 +165,8 @@ export default function Game() {
     const cards = {};
     players.forEach(p => { cards[p] = ['Yes_1', 'Yes_2', 'Yes_3', 'No_1', 'No_2', 'No_3', 'Wildcard', 'Indifferent']; });
 
-    const dealtTiles = {[players[0]]: [], [players[1]]: []};
+    const dealtTiles = {};
+    players.forEach((p) => { dealtTiles[p] = []; });
     const groupedByFamily = {};
     all.forEach(tile => {
       const family = tile.type.replace('__type_2_', '');
@@ -87,19 +176,20 @@ export default function Game() {
     let oddGoesTo = 0;
     Object.values(groupedByFamily).forEach(group => {
       const shuffled = [...group].sort(() => Math.random() - 0.5);
-      const half = Math.floor(shuffled.length / 2);
-      dealtTiles[players[0]].push(...shuffled.slice(0, half));
-      dealtTiles[players[1]].push(...shuffled.slice(half, half * 2));
-      if(shuffled.length % 2 === 1) {
-        dealtTiles[players[oddGoesTo]].push(shuffled[shuffled.length - 1]);
-        oddGoesTo = 1 - oddGoesTo;
-      }
+      shuffled.forEach((tile, idx) => {
+        dealtTiles[players[(oddGoesTo + idx) % players.length]].push(tile);
+      });
+      oddGoesTo = (oddGoesTo + shuffled.length) % players.length;
     });
 
     setTiles(dealtTiles);
-    setSecretBuildings({[players[0]]: bldgs[0], [players[1]]: bldgs[1]});
+    const secrets = {};
+    players.forEach((p, idx) => { secrets[p] = bldgs[idx % bldgs.length]; });
+    setSecretBuildings(secrets);
     setVotingCards(cards);
-    setScores({[players[0]]: 15, [players[1]]: 15});
+    const initialScores = {};
+    players.forEach((p) => { initialScores[p] = 15; });
+    setScores(initialScores);
     setStarted(true);
   };
   
@@ -203,6 +293,7 @@ export default function Game() {
   };
   
   const onDragStart = (e, tile) => {
+    if(!isMyTurn || pendingVote) return;
     e.dataTransfer.effectAllowed = 'move';
     setDragging(tile);
     setValidMoves(calcMoves(tile));
@@ -288,7 +379,7 @@ export default function Game() {
       setGameEnded(true);
       const winnerName = Object.keys(newScores).reduce((a, b) => newScores[a] > newScores[b] ? a : b);
       setWinner(winnerName);
-    } else { setCurrentPlayer(1 - currentPlayer); }
+    } else { setCurrentPlayer((currentPlayer + 1) % players.length); }
 
     setDragging(null);
     setValidMoves([]);
@@ -298,13 +389,14 @@ export default function Game() {
   const handleVote = () => {
     const votePass = resolveVote();
     if(votePass) { placeTile(pendingVote.move, pendingVote.tile); } 
-    else { setCurrentPlayer(1 - currentPlayer); }
+    else { setCurrentPlayer((currentPlayer + 1) % players.length); }
     setPendingVote(null);
     setVoteSelections({});
     setWildcardChoice(null);
   };
   
   const toggleVoteCard = (player, card) => {
+    if(player !== myPlayerName) return;
     if(card === 'Wildcard') {
       setWildcardChoice({player, callback: (choice) => {
         const current = voteSelections[player] || [];
@@ -319,28 +411,49 @@ export default function Game() {
   };
   
   if(!started) return (
-    <div style={{display:'flex',alignItems:'center',justifyContent:'center',minHeight:'100vh',background:'#D2691E'}}>
-      <button onClick={startGame} style={{padding:'30px 60px',fontSize:'28px',background:'#FFD700',border:'none',borderRadius:'15px',cursor:'pointer',fontWeight:'bold'}}>Start</button>
+    <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'100vh',background:'#D2691E',gap:'14px',padding:'20px'}}>
+      <h1 style={{color:'white',margin:0}}>Wacky Wacky West Online</h1>
+      <div style={{background:'white',padding:'18px',borderRadius:'12px',maxWidth:'560px',width:'100%'}}>
+        <div style={{fontSize:'14px',marginBottom:'10px'}}>Share this link: <a href={window.location.href}>{window.location.href}</a></div>
+        <div style={{display:'flex',gap:'8px',marginBottom:'10px'}}>
+          <input value={playerName} onChange={(e)=>setPlayerName(e.target.value)} placeholder='Your name' style={{flex:1,padding:'8px'}}/>
+          <button onClick={()=>{localStorage.setItem('www_name', playerName); joinRoom();}}>Save</button>
+        </div>
+        <div style={{display:'flex',gap:'8px',alignItems:'center',marginBottom:'10px'}}>
+          <span>Players:</span>
+          {[2,3,4].map(n => <button key={n} disabled={!isHost || roomMeta.started} onClick={()=>api('/api/set-max','POST',{roomId,seatToken,maxPlayers:n})} style={{padding:'6px 10px',background:roomMeta.maxPlayers===n?'#FFD700':'#eee'}}>{n}</button>)}
+        </div>
+        <div style={{fontSize:'14px',marginBottom:'10px'}}>
+          Seats: {Object.entries(roomMeta.seats).map(([i,s])=>`#${Number(i)+1} ${s.name}${s.connected?'':' (offline)'}`).join(', ') || 'none'}
+        </div>
+        <button disabled={!isHost || Object.keys(roomMeta.seats).length < 2 || Object.keys(roomMeta.seats).length > 4 || !socketReady} onClick={async ()=>{await api('/api/start','POST',{roomId,seatToken}); if(isHost) startGame();}} style={{padding:'14px 22px',fontSize:'20px',background:'#FFD700',border:'none',borderRadius:'10px',cursor:'pointer',fontWeight:'bold'}}>
+          {isHost ? 'Start Game' : 'Waiting for host...'}
+        </button>
+      </div>
     </div>
   );
   
   const pn = players[currentPlayer];
-  const pt = tiles[pn] || [];
-  const sb = secretBuildings[pn];
+  const pt = tiles[myPlayerName] || [];
+  const sb = secretBuildings[myPlayerName];
+  const panelPlayer = viewingPanelPlayer || myPlayerName || pn;
+  const panelTiles = tiles[panelPlayer] || [];
+  const panelVotes = votingCards[panelPlayer] || [];
   
   return (
     <div style={{padding:'15px',background:'#F5DEB3',minHeight:'100vh'}}>
       <div style={{marginBottom:'15px',background:'white',padding:'12px 20px',borderRadius:'10px'}}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
           <div>
-            <h2 style={{margin:0}}>Wacky West - {pn}</h2>
+            <h2 style={{margin:0}}>Wacky West - Turn: {pn}</h2>
             <div style={{display:'flex',gap:'20px',marginTop:'8px',fontSize:'14px'}}>
-              <span>Tiles: {pt.length}</span>
+              <span>Your seat: {myPlayerName || 'Joining...'}</span>
+              <span>Your tiles: {pt.length}</span>
               <span style={{fontWeight:'bold'}}>{pn}: {scores[pn] ?? 15} points</span>
             </div>
           </div>
           <div style={{display:'flex',gap:'5px',flexWrap:'wrap',maxWidth:'300px'}}>
-            {votingCards[pn]?.map(card => (
+            {panelVotes.map(card => (
               <div key={card} style={{width:'40px',height:'55px',border:'1px solid #ccc',borderRadius:'3px',overflow:'hidden'}}>
                 <img src={IMAGES[card]} style={{width:'100%',height:'100%',objectFit:'cover'}} alt={card}/>
               </div>
@@ -353,7 +466,7 @@ export default function Game() {
         <div style={{flex:'0 0 70%'}}>
           <div ref={boardRef} onDragOver={onDragOver} onDrop={onDrop} style={{background:'white',padding:'8px',borderRadius:'10px',position:'relative'}}>
             <img src={IMAGES.board} style={{width:'100%',display:'block',border:'3px solid #8B4513',borderRadius:'5px'}} alt=""/>
-            <svg style={{position:'absolute',top:'8px',left:'8px',width:'calc(100% - 16px)',height:'calc(100% - 16px)',pointerEvents:'none'}} viewBox="0 0 2000 1426">
+            <svg style={{position:'absolute',top:'8px',left:'8px',width:'calc(100% - 16px)',height:'calc(100% - 16px)',pointerEvents:'auto'}} viewBox="0 0 2000 1426">
               {dragging && validMoves.map((m,i) => m.cells.map(([c,r],j) => {
                 const hover = previewMove?.cells.some(([hc,hr]) => hc===c && hr===r);
                 return <rect key={`${i}-${j}`} x={V[c]} y={H[r]} width={V[c+1]-V[c]} height={H[r+1]-H[r]} fill={hover?"yellow":"lime"} opacity={hover?0.7:0.5} stroke={hover?"orange":"yellow"} strokeWidth="5"/>;
@@ -385,24 +498,34 @@ export default function Game() {
                 const centerX = x + w / 2, centerY = y + h / 2;
                 const adjustedRot = tile.rotation + 90;
                 const imageLayout = getTileImageLayout(x, y, w, h, adjustedRot);
-                return <image key={`tile-${idx}`} x={imageLayout.x} y={imageLayout.y} width={imageLayout.width} height={imageLayout.height} href={IMAGES[tile.type]} preserveAspectRatio="xMidYMid meet" transform={`rotate(${adjustedRot} ${centerX} ${centerY})`}/>;
+                return <image key={`tile-${idx}`} x={imageLayout.x} y={imageLayout.y} width={imageLayout.width} height={imageLayout.height} href={IMAGES[tile.type]} preserveAspectRatio="xMidYMid meet" opacity={hoveredPlacedTileIndex === idx ? 0.55 : 1} onMouseEnter={() => setHoveredPlacedTileIndex(idx)} onMouseLeave={() => setHoveredPlacedTileIndex(null)} transform={`rotate(${adjustedRot} ${centerX} ${centerY})`}/>;
               })}
-              {Object.entries(workers).map(([n,w]) => <image key={n} x={V[w.c]+20} y={H[w.r]+20} width={V[w.c+1]-V[w.c]-40} height={H[w.r+1]-H[w.r]-40} href={IMAGES.worker} preserveAspectRatio="xMidYMid meet"/>)}
+              {Object.entries(workers).map(([n,w]) => <image key={n} x={V[w.c]+20} y={H[w.r]+20} width={V[w.c+1]-V[w.c]-40} height={H[w.r+1]-H[w.r]-40} href={IMAGES.worker} preserveAspectRatio="xMidYMid meet" style={{mixBlendMode:'screen'}}/>)}
             </svg>
           </div>
         </div>
         
         <div style={{flex:'0 0 28%',display:'flex',flexDirection:'column',gap:'10px',maxHeight:'85vh'}}>
           <div style={{background:'white',padding:'10px',borderRadius:'10px'}}>
-            <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>Secret: {sb?.replace(/_/g,' ')}</h4>
-            <img src={IMAGES[sb]} style={{width:'100%',maxHeight:'100px',objectFit:'contain'}} alt=""/>
+            <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>View another player's hand</h4>
+            <div style={{display:'flex',gap:'6px',flexWrap:'wrap'}}>
+              {players.map((playerName) => (
+                <button key={playerName} onClick={() => setViewingPanelPlayer(playerName)} style={{padding:'6px 8px',fontSize:'12px',background: panelPlayer===playerName ? '#FFD700' : '#eee',border:'1px solid #ccc',borderRadius:'6px'}}>
+                  {playerName}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div style={{background:'white',padding:'10px',borderRadius:'10px'}}>
+            <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>Secret: {gameEnded ? (sb?.replace(/_/g,' ')) : 'Hidden until game end'}</h4>
+            {gameEnded && <img src={IMAGES[sb]} style={{width:'100%',maxHeight:'100px',objectFit:'contain'}} alt=""/>}
           </div>
           <div style={{background:'white',padding:'10px',borderRadius:'10px',flex:1,display:'flex',flexDirection:'column',minHeight:0,overflow:'hidden'}}>
-            <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>Your Tiles ({pt.length})</h4>
+            <h4 style={{margin:'0 0 8px 0',fontSize:'13px'}}>{panelPlayer === myPlayerName ? 'Your' : `${panelPlayer}'s`} Tiles ({panelTiles.length})</h4>
             <div style={{overflowY:'auto',flex:1,paddingRight:'5px'}}>
               <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'8px',alignContent:'start'}}>
-                {pt.map(t => (
-                  <div key={t.id} draggable onDragStart={(e)=>onDragStart(e,t)} onDrag={onDrag} onDragEnd={onDragEnd} 
+                {panelTiles.map(t => (
+                  <div key={t.id} draggable={panelPlayer === myPlayerName && isMyTurn && !pendingVote} onDragStart={(e)=>onDragStart(e,t)} onDrag={onDrag} onDragEnd={onDragEnd} 
                        style={{
                          height:'80px',
                          border:'1px solid #ccc',
@@ -447,10 +570,10 @@ export default function Game() {
           <h3 style={{margin:'0 0 15px 0'}}>Outhouse - Vote!</h3>
           {players.map(player => (
             <div key={player} style={{marginBottom:'15px'}}>
-              <h4 style={{margin:'5px 0'}}>{player}</h4>
+              <h4 style={{margin:'5px 0'}}>{player}{player===myPlayerName ? ' (you)' : ''}</h4>
               <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:'6px'}}>
                 {votingCards[player].map(card => {
-                  const selected = (voteSelections[player] || []).some(c => c === card || c.startsWith(card));
+                  const selected = player === myPlayerName && (voteSelections[player] || []).some(c => c === card || c.startsWith(card));
                   return (
                     <div key={card} onClick={() => toggleVoteCard(player, card)} style={{border: selected ? '3px solid #FFD700' : '2px solid #ccc',padding:'3px',cursor:'pointer',borderRadius:'4px',background: selected ? '#FFFACD' : 'white'}}>
                       <img src={IMAGES[card]} style={{width:'100%',display:'block'}} alt={card}/>
